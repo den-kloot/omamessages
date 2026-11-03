@@ -475,13 +475,9 @@ impl Ui {
             .cache_properties(zbus::proxy::CacheProperties::No)
             .build()
             .await?;
-        let dbus = zbus::fdo::DBusProxy::new(&conn).await?;
-        let up = dbus
-            .name_has_owner(omatel_api::MESSAGES_NAME.try_into()?)
-            .await
-            .unwrap_or(false);
         let mut owners = proxy.inner().receive_owner_changed().await?;
         let mut changes = proxy.receive_messages_changed().await?;
+        let up = activate_service(&conn).await;
         {
             let Some(ui) = weak.upgrade() else {
                 return Ok(());
@@ -2145,4 +2141,28 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .open(path)?;
     f.write_all(bytes)?;
     f.sync_all()
+}
+
+/// Ask the session bus to activate the Messages agent, then say whether its
+/// name has an owner.
+///
+/// The agent is D-Bus activatable (`SystemdService=omatel-agent.service`), so
+/// a user session where its unit was never enabled still gets it on demand:
+/// `StartServiceByName` starts the unit, which is what the agent's own
+/// activation file promises. Without this, a fresh install opened Messages to
+/// "Messages service isn't running" although nothing was wrong beyond the unit
+/// being inactive. The banner stays for the real failure: the name still has no
+/// owner after activation was asked for, or activation itself failed.
+async fn activate_service(conn: &zbus::Connection) -> bool {
+    let Ok(dbus) = zbus::fdo::DBusProxy::new(conn).await else {
+        return false;
+    };
+    let Ok(name) = zbus::names::WellKnownName::try_from(omatel_api::MESSAGES_NAME) else {
+        return false;
+    };
+    match dbus.start_service_by_name(name.as_ref(), 0).await {
+        Ok(reply) => tracing::debug!(reply, "messages service activation"),
+        Err(e) => tracing::warn!(error = %e, "messages service activation failed"),
+    }
+    dbus.name_has_owner(name.into()).await.unwrap_or(false)
 }
